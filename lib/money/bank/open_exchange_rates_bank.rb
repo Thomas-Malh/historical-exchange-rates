@@ -182,6 +182,28 @@ class Money
         @source ||= OE_SOURCE
       end
 
+      def exchange_at(date, from_money, to_currency)
+        return from_money if same_currency?(from_money.currency, to_currency)
+
+        rate = get_rate_at(date, from_money.currency, to_currency)
+        raise UnknownRate, "No conversion rate available for #{date} '#{from_money.currency.iso_code}' -> '#{to_currency}'" unless rate
+
+        _to_currency_ = Currency.wrap(to_currency)
+
+        cents = BigDecimal(from_money.cents.to_s) / (BigDecimal(from_money.currency.subunit_to_unit.to_s) / BigDecimal(_to_currency_.subunit_to_unit.to_s))
+
+        ex = cents * BigDecimal(rate.to_s)
+        ex = ex.to_f
+        ex = if block_given?
+               yield ex
+             elsif @rounding_method
+               @rounding_method.call(ex)
+             else
+               ex.to_s.to_i
+             end
+        Money.new(ex, _to_currency_)
+      end
+
       # Update all rates from openexchangerates JSON
       #
       # @return [Array] Array of exchange rates
@@ -265,8 +287,12 @@ class Money
       # defined with app_id
       #
       # @return [String] URL
-      def source_url
-        str = "#{oer_url}?app_id=#{app_id}"
+      def source_url(specified_date=nil)
+        if specified_date
+          str = "#{URI.join(OER_HISTORICAL_URL, "#{specified_date}.json")}?app_id=#{app_id}"
+        else
+          str = "#{oer_url}?app_id=#{app_id}"
+        end
         str = "#{str}&base=#{source}" unless source == OE_SOURCE
         str = "#{str}&show_alternative=#{show_alternative}"
         str = "#{str}&prettyprint=#{prettyprint}"
@@ -275,6 +301,76 @@ class Money
       end
 
       protected
+
+      def get_rate_at(date, from, to)
+        existing_rates = load_data_at(date)
+        rate = nil
+        if existing_rates
+          rate = existing_rates[rate_key_for(from, to)]
+          unless rate
+            # Tries to calculate an inverse rate
+            inverse_rate = existing_rates[rate_key_for(to, from)]
+            rate = 1.0 / inverse_rate if inverse_rate
+          end
+          unless rate
+            # Tries to calculate a pair rate using USD rate
+            unless from_base_rate = existing_rates[rate_key_for('USD', from)]
+              from_inverse_rate = existing_rates[rate_key_for(from, 'USD')]
+              from_base_rate = 1.0 / from_inverse_rate if from_inverse_rate
+            end
+            unless to_base_rate = existing_rates[rate_key_for('USD', to)]
+              to_inverse_rate = existing_rates[rate_key_for(to, 'USD')]
+              to_base_rate = 1.0 / to_inverse_rate if to_inverse_rate
+            end
+            rate = to_base_rate / from_base_rate if to_base_rate && from_base_rate
+          end
+        end
+        rate
+      end
+
+      def load_data_at(date)
+        cache_key = "oxr_#{date}"
+        data = Rails.cache.read(cache_key)
+
+        unless data
+          fetched_data = fetch_at(date)
+          data = (
+            if fetched_data
+              base_currency = fetched_data['base'] || 'USD'
+              rates_hash = {}
+              fetched_data['rates'].each do |currency, rate|
+                if Money::Currency.find(base_currency) && Money::Currency.find(currency)
+                  rates_hash[rate_key_for(base_currency, currency)] = rate
+                end
+              end
+              Rails.cache.write(cache_key, rates_hash, expires_in: 10.years)
+              rates_hash
+            else
+              {}
+            end
+          )
+        end
+        data
+      end
+
+      def fetch_at(date)
+        puts "Money OXR - Fetch exchange rates for #{date}"
+        uri = URI(source_url(date))
+        req = Net::HTTP::Get.new(uri)
+        res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+        if res.is_a?(Net::HTTPOK)
+          puts "Money OXR - Fetch OK"
+          JSON.parse(res.body)
+        else
+          puts "Money OXR - Fetch error"
+          puts res.body
+          nil
+        end
+      end
+
+      def rate_key_for(from, to)
+        "#{Currency.wrap(from).iso_code}_TO_#{Currency.wrap(to).iso_code}".upcase
+      end
 
       # Save rates on cache
       # Can raise InvalidCache
